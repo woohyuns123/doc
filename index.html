@@ -1,0 +1,450 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>부서별 과제명 문서 건수 (연도 비교)</title>
+  <script src="https://cdn.plot.ly/plotly-2.30.0.min.js"></script>
+  <style>
+    body { font-family: Arial, sans-serif; margin:0; background:#fff; }
+    .wrap { max-width:1200px; margin:40px auto; padding:0 16px; }
+    .row { display:flex; gap:16px; align-items:center; flex-wrap:wrap; }
+    .card { min-width:260px; }
+    label { display:block; font-size:13px; margin-bottom:6px; }
+    select, input[type="range"], input[type="text"] { width:100%; padding:8px; box-sizing:border-box; }
+    .checks { display:flex; gap:12px; flex-wrap:wrap; }
+
+    #bar { width:100%; height:620px; }
+    .row2 { display:flex; gap:16px; flex-wrap:wrap; }
+    #trend, #approver { flex:1; min-width:480px; height:520px; }
+
+    #note { color:#666; font-size:12px; margin-top:6px; }
+    .topn-val { font-size:12px; color:#444; margin-top:6px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h2>부서별 과제명 문서 건수 (연도 비교)</h2>
+
+    <div class="row">
+      <div class="card" style="min-width:360px; flex:1;">
+        <label>부서(검색 가능)</label>
+        <input id="deptSearch" type="text" placeholder="부서를 검색하세요" />
+        <select id="dept"></select>
+      </div>
+
+      <div class="card" style="min-width:320px;">
+        <label>연도(체크박스)</label>
+        <div class="checks">
+          <label><input type="checkbox" class="year" value="2024" checked> 2024</label>
+          <label><input type="checkbox" class="year" value="2025" checked> 2025</label>
+        </div>
+      </div>
+
+      <div class="card" style="min-width:260px;">
+        <label>TOP N</label>
+        <input id="topn" type="range" min="5" max="50" step="1" value="20" />
+        <div class="topn-val">TOP N: <span id="topnVal">20</span></div>
+      </div>
+    </div>
+
+    <div style="height:12px;"></div>
+    <div id="bar"></div>
+
+    <div class="row2">
+      <div id="trend"></div>
+      <div id="approver"></div>
+    </div>
+
+    <div id="note"></div>
+  </div>
+
+<script>
+/* ===== 고정 색상 ===== */
+const COLOR_MAP = {
+  2024: "#1f77b4", // 파란색
+  2025: "#ff7f0e"  // 주황색
+};
+
+let DATA = null;
+
+/* ===== 공통 유틸 ===== */
+function mean(arr) {
+  const a = (arr || []).map(v => Number(v) || 0);
+  return a.length ? a.reduce((s,v)=>s+v,0) / a.length : 0;
+}
+
+// category x축에서 전체 폭 가로지르는 hline
+function hlineShape(y, color, nCategories) {
+  return {
+    type: "line",
+    xref: "x",
+    yref: "y",
+    x0: -0.5,
+    x1: Math.max(nCategories - 0.5, 0.5),
+    y0: y,
+    y1: y,
+    line: { color: color, width: 2, dash: "dash" }
+  };
+}
+
+function selectedYears() {
+  return Array.from(document.querySelectorAll("input.year:checked")).map(x => Number(x.value));
+}
+
+function normalizeYears(choice, allYears) {
+  const picked = (choice || []).slice().sort((a,b)=>a-b);
+  const all = (allYears || []).slice().sort((a,b)=>a-b);
+  if (picked.length === 0 || (picked.length === all.length && picked.every((v,i)=>v===all[i]))) {
+    return { years: allYears, label: "전체" };
+  }
+  return { years: picked, label: picked.join(", ") };
+}
+
+/* ===== 과제별 집계 ===== */
+function aggCompare(records, dept, years, topN) {
+  const deptTrim = String(dept || "").trim();
+  const yrSet = new Set(years.map(Number));
+  const filtered = (records || []).filter(r =>
+    String(r["부서명"]).trim() === deptTrim && yrSet.has(Number(r["연도"]))
+  );
+  if (filtered.length === 0) return null;
+
+  // TOP N by sum over selected years
+  const sums = new Map();
+  for (const r of filtered) {
+    const k = String(r["task_key"]).trim();
+    const c = Number(r["건수"]) || 0;
+    sums.set(k, (sums.get(k) || 0) + c);
+  }
+
+  const order = Array.from(sums.entries())
+    .sort((a,b)=> (b[1]-a[1]) || String(a[0]).localeCompare(String(b[0])))
+    .slice(0, Number(topN))
+    .map(x=>x[0]);
+  const orderSet = new Set(order);
+
+  // Full grid (task, year) fill 0
+  const m = new Map(); // task||year -> count
+  for (const r of filtered) {
+    const task = String(r["task_key"]).trim();
+    if (!orderSet.has(task)) continue;
+    const y = Number(r["연도"]);
+    const key = task + "||" + y;
+    m.set(key, (m.get(key) || 0) + (Number(r["건수"])||0));
+  }
+
+  return { order, map: m };
+}
+
+/* ===== 성명별 생산문서 건수(trend) ===== */
+function renderNameBar(dept, years, topN) {
+  const deptTrim = String(dept || "").trim();
+  const yrSet = new Set(years.map(Number));
+
+  const rows = (DATA.name_records || []).filter(r =>
+    String(r["부서명"]).trim() === deptTrim && yrSet.has(Number(r["연도"]))
+  );
+
+  if (rows.length === 0) {
+    Plotly.react("trend", [], {
+      title: { text: `${dept} 성명별 생산문서 건수 (데이터 없음)` },
+      margin: { l:40, r:20, t:60, b:80 }
+    }, { responsive: true });
+    return;
+  }
+
+  // 성명별 + 연도별 집계
+  const m = new Map();       // name||year -> count
+  const nameSum = new Map(); // name -> total(선택연도 합산)
+
+  for (const r of rows) {
+    const name = String(r["성명"]).trim();
+    const y = Number(r["연도"]);
+    const c = Number(r["건수"]) || 0;
+    const key = name + "||" + y;
+
+    m.set(key, (m.get(key) || 0) + c);
+    nameSum.set(name, (nameSum.get(name) || 0) + c);
+  }
+
+  // TOP N 성명 선택
+  const order = Array.from(nameSum.entries())
+    .sort((a,b)=> (b[1]-a[1]) || String(a[0]).localeCompare(String(b[0])))
+    .slice(0, Number(topN))
+    .map(x=>x[0]);
+
+  const traces = [];
+  const shapesTrend = [];
+
+  const yearOrder = (DATA.years || []).filter(y => yrSet.has(y));
+
+  for (const y of yearOrder) {
+    const vals = order.map(name => m.get(name + "||" + y) || 0);
+    const mval = mean(vals);
+
+    traces.push({
+      type: "bar",
+      // ✅ 범례에 평균 포함
+      name: `${y} (평균: ${mval.toFixed(1)}건)`,
+      x: order,
+      y: vals,
+      marker: { color: COLOR_MAP[y] || "#888" },
+      // ✅ 평균선 draw용 원본 유지
+      customdata: { year: y, mean: mval }
+    });
+
+    // ✅ 평균선(점선)만 추가
+    shapesTrend.push(hlineShape(mval, COLOR_MAP[y] || "#888", order.length));
+  }
+
+  Plotly.react("trend", traces, {
+    title: `${dept} 성명별 생산문서 건수 (TOP ${topN})`,
+    barmode: "group",
+    xaxis: { title: "성명", tickangle: -45 },
+    yaxis: { title: "건수", rangemode: "tozero" },
+    shapes: shapesTrend,
+    // ✅ 평균 텍스트 annotation 제거
+    annotations: [],
+    margin: { l:40, r:40, t:60, b:160 },
+    legend: {}
+  }, { responsive: true });
+}
+
+/* ===== 최종결재자별 결재시간(approver) ===== */
+function renderApproverTime(dept, years, topN) {
+  const deptTrim = String(dept || "").trim();
+  const yrSet = new Set(years.map(Number));
+
+  const rows = (DATA.approver_records || []).filter(r =>
+    String(r["부서명"]).trim() === deptTrim && yrSet.has(Number(r["연도"]))
+  );
+
+  if (rows.length === 0) {
+    Plotly.react("approver", [], {
+      title: { text: `${dept} 최종결재자별 결재시간(영업일) (데이터 없음)` },
+      margin: { l:40, r:20, t:60, b:80 }
+    }, { responsive: true });
+    return;
+  }
+
+  // TOP N 기준: 선택 연도 합산 '건수'로 정렬
+  const sumCnt = new Map(); // approver -> total count
+  const m = new Map();      // approver||year -> avg
+
+  for (const r of rows) {
+    const a = String(r["최종결재자"]).trim();
+    const y = Number(r["연도"]);
+    const cnt = Number(r["건수"]) || 0;
+    const avg = Number(r["평균"]) || 0;
+
+    sumCnt.set(a, (sumCnt.get(a) || 0) + cnt);
+    m.set(a + "||" + y, avg);
+  }
+
+  const order = Array.from(sumCnt.entries())
+    .sort((a,b)=> (b[1]-a[1]) || String(a[0]).localeCompare(String(b[0])))
+    .slice(0, Number(topN))
+    .map(x=>x[0]);
+
+  const traces = [];
+  const shapesAppr = [];
+
+  const yearOrder = (DATA.years || []).filter(y => yrSet.has(y));
+
+  for (const y of yearOrder) {
+    const vals = order.map(a => m.get(a + "||" + y) || 0);
+    const mval = mean(vals);
+
+    traces.push({
+      type: "bar",
+      // ✅ 범례에 평균 포함
+      name: `${y} (평균: ${mval.toFixed(1)}일)`,
+      x: order,
+      y: vals,
+      marker: { color: COLOR_MAP[y] || "#888" },
+      customdata: { year: y, mean: mval }
+    });
+
+    shapesAppr.push(hlineShape(mval, COLOR_MAP[y] || "#888", order.length));
+  }
+
+  Plotly.react("approver", traces, {
+    title: `${dept} 최종결재자별 평균 결재시간(영업일) (TOP ${topN})`,
+    barmode: "group",
+    xaxis: { title: "최종결재자", tickangle: -45 },
+    yaxis: { title: "평균 결재시간(영업일)", rangemode: "tozero" },
+    shapes: shapesAppr,
+    annotations: [],
+    margin: { l:40, r:40, t:60, b:170 },
+    legend: {}
+  }, { responsive: true });
+}
+
+/* ===== 전체 렌더 ===== */
+function render() {
+  const dept = document.getElementById("dept").value;
+  const topN = Number(document.getElementById("topn").value) || 20;
+
+  const picked = selectedYears();
+  const norm = normalizeYears(picked, DATA.years);
+  const years = norm.years;
+
+  const title = `[${norm.label}] ${dept} 과제 문서 건수 비교 (TOP ${topN})`;
+  const note = document.getElementById("note");
+
+  const comp = aggCompare(DATA.records, dept, years, topN);
+
+  if (!comp) {
+    Plotly.react("bar", [], {
+      title: { text: title },
+      barmode: "group",
+      xaxis: { title: "과제" },
+      yaxis: { title: "문서 건수" },
+      shapes: [],
+      annotations: [],
+      margin: { l:40, r:20, t:80, b:160 },
+      legend: {}
+    }, {responsive:true});
+
+    Plotly.react("trend", [], { title: { text: `${dept} 성명별 생산문서 건수` }, annotations: [] }, { responsive:true });
+    Plotly.react("approver", [], { title: { text: `${dept} 최종결재자별 결재시간(영업일)` }, annotations: [] }, { responsive:true });
+
+    note.textContent = "선택 조건에서 과제 데이터(records)가 없습니다.";
+    return;
+  }
+
+  // bar: 과제 라벨 매핑
+  const labelMap = DATA.task_label_map || {};
+  const label = (k) => labelMap[k] ? labelMap[k] : k;
+  const x = comp.order.map(label);
+
+  const yearOrder = (DATA.years || []).filter(y => years.includes(y)).map(Number);
+
+  const traces = [];
+  const shapesBar = [];
+
+  for (const yNum of yearOrder) {
+    const yVals = comp.order.map(task => comp.map.get(task + "||" + yNum) || 0);
+    const mval = mean(yVals);
+
+    traces.push({
+      type: "bar",
+      // ✅ 범례에 평균 포함
+      name: `${yNum} (평균: ${mval.toFixed(1)}건)`,
+      x: x,
+      y: yVals,
+      marker: { color: COLOR_MAP[yNum] || "#888" },
+      customdata: { year: yNum, mean: mval }
+    });
+
+    // ✅ 평균선(점선)
+    shapesBar.push(hlineShape(mval, COLOR_MAP[yNum] || "#888", x.length));
+  }
+
+  Plotly.react("bar", traces, {
+    title: { text: title },
+    barmode: "group",
+    xaxis: { title: "과제", tickangle: 45 },
+    yaxis: { title: "문서 건수", rangemode: "tozero" },
+    shapes: shapesBar,
+    // ✅ 평균 텍스트 annotation 제거
+    annotations: [],
+    margin: { l:40, r:40, t:80, b:160 },
+    legend: {}
+  }, {responsive:true});
+
+  // 옆 2개 차트
+  renderNameBar(dept, years, topN);
+  renderApproverTime(dept, years, topN);
+
+  // 데이터 존재 안내
+  const missing = [];
+  if (!("name_records" in DATA)) missing.push("name_records");
+  if (!("approver_records" in DATA)) missing.push("approver_records");
+
+  if (missing.length) {
+    note.textContent = `주의: data.json에 ${missing.join(", ")} 가 없습니다. (집계 포함 후 재생성 필요)`;
+  } else {
+    note.textContent = "";
+  }
+}
+
+/* ===== 부서 옵션 ===== */
+function updateDeptOptions(searchText) {
+  const sel = document.getElementById("dept");
+  const current = sel.value;
+  const q = String(searchText||"").toLowerCase().trim();
+
+  const depts = (DATA.depts || []).filter(d => d.toLowerCase().includes(q));
+  sel.innerHTML = "";
+  for (const d of depts) {
+    const opt = document.createElement("option");
+    opt.value = d;
+    opt.textContent = d;
+    sel.appendChild(opt);
+  }
+  if (depts.includes(current)) sel.value = current;
+  else if (depts.length > 0) sel.value = depts[0];
+}
+
+/* ===== 초기화 ===== */
+async function init() {
+  const res = await fetch("./data.json", { cache:"no-store" });
+  const payload = await res.json();
+
+  // dept list: records + name_records + approver_records 모두에서 수집 (누락 방지)
+  const deptSet = new Set();
+  for (const r of (payload.records || [])) deptSet.add(String(r["부서명"]).trim());
+  for (const r of (payload.name_records || [])) deptSet.add(String(r["부서명"]).trim());
+  for (const r of (payload.approver_records || [])) deptSet.add(String(r["부서명"]).trim());
+
+  payload.depts = Array.from(deptSet).sort((a,b)=>a.localeCompare(b));
+  DATA = payload;
+
+  updateDeptOptions("");
+
+  const deptSearchEl = document.getElementById("deptSearch");
+
+// 엔터 누를 때만 검색 적용 (그 전까지 페이지/차트 변화 없음)
+deptSearchEl.addEventListener("keydown", (e) => {
+  if (e.key !== "Enter") return;
+
+  e.preventDefault();
+
+  // 엔터 시점에만 옵션 갱신 + 렌더
+  updateDeptOptions(deptSearchEl.value);
+
+  // 검색 결과가 있으면 현재 선택부서가 바뀔 수 있으니 렌더
+  render();
+});
+
+// (선택) ESC 누르면 검색어 지우고 전체 부서로 복구도 엔터 없이 즉시 안 바뀌게 하려면,
+// 아래처럼 ESC에서도 "지우기만" 하고 적용은 Enter로 유지
+deptSearchEl.addEventListener("keydown", (e) => {
+  if (e.key !== "Escape") return;
+  deptSearchEl.value = "";
+});
+
+  document.getElementById("dept").addEventListener("change", render);
+
+  document.getElementById("topn").addEventListener("input", (e) => {
+    document.getElementById("topnVal").textContent = e.target.value;
+    render();
+  });
+
+  for (const el of document.querySelectorAll("input.year")) {
+    el.addEventListener("change", render);
+  }
+
+  render();
+}
+
+init().catch(err => {
+  console.error(err);
+  document.getElementById("note").textContent =
+    "data.json 로드 실패: 같은 폴더에 data.json이 있는지, 로컬 서버로 열었는지 확인하세요.";
+});
+</script>
+</body>
+</html>
